@@ -21,16 +21,20 @@
     /**
      * トークン発行
      *
-     * @param Request $request
      * @param User $user
-     * @return \Illuminate\Http\JsonResponse
+     * @param string $auth_secret_key
+     * @return string
      */
-    public function IssuingToken(Request $request, User $user): \Illuminate\Http\JsonResponse
+    public static function issuingToken(User $user, string $auth_secret_key): string
     {
-        $key = InMemory::base64Encoded('hiG8DlOKvtih6AxlZn5XKImZ06yu8I3mkOzaJrEuW8yAv8Jnkw330uMt8AEqQ5LB');
-        // セッションIDの生成(userId + 有効期限 + 乱数とかで生成するのが良いかも)
-        $session_id = bin2hex(random_bytes(16));
-        // トークンの発行
+        // 32文字のbase64エンコードされた文字列を投げる
+        $key = InMemory::base64Encoded($auth_secret_key);
+
+        // セッションIDの生成
+        $salt = env('HASH_SALT');
+        // jtiを生成する前情報
+        $pre_jti = $user->uuid . Carbon::now()->timestamp;
+        $jti = md5($pre_jti . $salt);
         $token = (new JwtFacade())->issue(
             new Sha256(),
             $key,
@@ -38,22 +42,15 @@
                 Builder $builder,
                 DateTimeImmutable $issue_at
             ) : Builder => $builder
-                // ここでトークンに付けたいパラメータを追加する
-                ->issuedBy('http://localhost:8000')
-                ->permittedFor('http://localhost:8000')
-                ->identifiedBy($session_id, true)
+                ->identifiedBy($jti, true)
                 ->issuedAt($issue_at)
-                ->expiresAt($issue_at->modify('+1 minute'))
+                ->expiresAt($issue_at->modify('+1 day'))
             );
 
-        // セッションIDを保存する
-        $user->remember_token = $session_id;
+        $user->pre_jti = $pre_jti;
         $user->save();
 
-        return response()->json([
-            'message' => 'success IssuingToken',
-            'token' => $token->toString(),
-        ]);
+        return $token->toString();
     }
     ```
 - トークンの解析と検証
@@ -63,45 +60,67 @@
      * - トークンの構造
      * - トークンの有効期限
      * - トークンのセッションID
+     * - トークンの署名
      *
      * @param Request $request
-     * @return \Illuminate\Http\JsonResponse
+     * @param User $user
+     * @param string $auth_secret_key
+     * @return string
      */
-    public function parseAndValidateToken(Request $request, User $user): \Illuminate\Http\JsonResponse
+    public static function parseAndValidateToken(Request $request, User $user, string $auth_secret_key): string
     {
-        // トークンをhederから取り出す
-        $jwt = $request->bearerToken();
-        // トークンの解析(jwtの形になっているか)
+        $jwt = $request->header('Request-Token');
         $parser = new Parser(new JoseEncoder());
-        try {
-            $token = $parser->parse($jwt);
-        } catch (CannotDecodeContent | InvalidTokenStructure | UnsupportedHeaderFound $e) {
-            return response()->json([
-                'parse error' => $e->getMessage(),
-            ], 401);
-        }
-        assert($token instanceof UnencryptedToken);
 
-        // トークンの検証(有効期限や保存したセッションIDと一致しているかなど)
         $validator = new Validator();
+        $salt = env('HASH_SALT');
+
         try {
+            // トークンの解析
+            $token = $parser->parse($jwt);
+
+            // トークンの検証
             $validator->assert($token, ...[
-                new \Lcobucci\JWT\Validation\Constraint\IssuedBy('http://localhost:8000'),
-                new \Lcobucci\JWT\Validation\Constraint\PermittedFor('http://localhost:8000'),
-                new \Lcobucci\JWT\Validation\Constraint\LooseValidAt(new NativeClock()),// 有効期限の検証
-                new \Lcobucci\JWT\Validation\Constraint\IdentifiedBy($user->remember_token),// セッションIDの検証
+                new \Lcobucci\JWT\Validation\Constraint\LooseValidAt(new CarbonClock()),
+                new \Lcobucci\JWT\Validation\Constraint\IdentifiedBy(md5($user->pre_jti . $salt)),
+                new \Lcobucci\JWT\Validation\Constraint\SignedWith(new Sha256(), InMemory::base64Encoded($auth_secret_key)),
             ]);
+        } catch (CannotDecodeContent | InvalidTokenStructure | UnsupportedHeaderFound $e) {
+            // トークンの解析エラー
+            throw app(ErrorService::class)->createException(
+                app(ErrorService::class)::AUTH_PARSE_ERROR,
+                [
+                    'UserId' => $user->user_id,
+                    'Uuid' => $user->uuid,
+                    'UidHash' => $user->uid_hash,
+                    'UidStatus' => $user->status,
+                    'ParseError' => $e->getMessage(),
+                ]
+            );
         } catch (RequiredConstraintsViolated $e) {
-            $user->remember_token = '';
-            $user->save();
-            return response()->json([
-                'validate error' => $e->getMessage(),
-            ], 401);
+            // トークンの検証エラー
+            if (str_contains($e->violations()[0]->constraint, 'LooseValidAt') == true) {
+                $validate_error = app(ErrorService::class)::AUTH_EXPIRED_ERROR;
+            } elseif (str_contains($e->violations()[0]->constraint, 'IdentifiedBy') == true) {
+                $validate_error = app(ErrorService::class)::AUTH_SESSION_ERROR;
+            } elseif (str_contains($e->violations()[0]->constraint, 'SignedWith') == true) {
+                $validate_error = app(ErrorService::class)::AUTH_SIGN_ERROR;
+            } else {
+                $validate_error = app(ErrorService::class)::AUTH_ERROR;
+            }
+
+            throw app(ErrorService::class)->createException(
+                $validate_error,
+                [
+                    'UserId' => $user->user_id,
+                    'Uuid' => $user->uuid,
+                    'UidHash' => $user->uid_hash,
+                    'UidStatus' => $user->status,
+                    'ValidationError' => $e->getMessage(),
+                ]
+            );
         }
 
-        return response()->json([
-            'message' => 'success parseAndValidateToken',
-            'token' => $token->toString(),
-        ]);
+        return $jwt;
     }
     ```
